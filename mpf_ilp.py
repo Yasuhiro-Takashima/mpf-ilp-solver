@@ -10,6 +10,10 @@ class GPMaxParser:
     """
     
     def __init__(self, filename=None):
+        """
+        Args:
+             filename: gpmax形式の入力ファイル名。省略時はparse()を後から呼ぶ。
+        """
         self.n_nodes = 0
         self.n_arcs = 0
         self.n_po_relations = 0
@@ -257,13 +261,13 @@ def my_callback(model, where):
     """
     Gurobi MIP 最適化のコールバック関数（早期終了制御）
 
-    経過時間が300秒を超えるか、実行可能解が見つかった場合に
+    経過時間が model._time_limit_cb を超えるか、実行可能解が見つかった場合に
     MIPギャップが十分小さければ最適化を打ち切る。
     model._threshold: 現在の終了ギャップ閾値（初期値 1.0）
     """
     if where == GRB.Callback.MIP:
         run_time = model.cbGet(GRB.Callback.RUNTIME)
-        if model._threshold < 1.0 or run_time >= 300:
+        if model._threshold < 1.0 or run_time >= model._time_limit_cb:
             obj_bst = model.cbGet(GRB.Callback.MIP_OBJBST)
             if obj_bst > 1e-10:
                 obj_bnd = model.cbGet(GRB.Callback.MIP_OBJBND)
@@ -272,7 +276,6 @@ def my_callback(model, where):
                     model._threshold = gap / 2.0
                     model.terminate()
 
-# method_name をクラス外・__main__ 外のモジュールレベルに移動
 METHOD_NAMES = ['MF', 'MPF_bigM', 'MPF_ind', 'MPF_bigM_mstep', 'MPF_ind_mstep']            
     
 class ILP_Solver:
@@ -280,7 +283,10 @@ class ILP_Solver:
     ILP Solver
     """
     def __init__(self, parser):
-
+        """
+        Args:
+            parser: GPMaxParser インスタンス（パース済みであること）
+        """
         self.out_arcs = {}
         self.in_arcs = {}
         self.capacities = {}
@@ -316,22 +322,25 @@ class ILP_Solver:
         self.sink_set = set(parser.get_sink_nodes())
             
     
-    def optimize(self, mpf_flag=1):
+    def optimize(self, mpf_flag=1, time_limit_cb=300, flow_lb_tol=0.01, flow_ub_tol=0.99):
         """
-        ILP モデルを構築して最適化を実行する。
+        ILP モデルを構築して最適化を実行する
         
-        Args:
-        mpf_flag (int): 最適化手法の選択
-            0: 最大フロー（優先度制約なし）
-            1: MPF big-M 定式化
-            2: MPF indicator 制約定式化
-            3: MPF big-M + 多段階求解
-            4: MPF indicator + 多段階求解
+        Args: 
+            mpf_flag (int): 最適化手法の選択
+                0: 最大フロー（優先度制約なし）
+                1: MPF big-M 定式化
+                2: MPF indicator 制約定式化
+                3: MPF big-M + 多段階求解
+                4: MPF indicator + 多段階求解
+            time_limit_cb (float): コールバックでの早期終了タイムリミット（秒, default: 300）
+            flow_lb_tol (float): この値以下の flow を持つ枝を非使用と判断し rfu を 0 に固定する閾値（default: 0.01）
+            flow_ub_tol (float): この値以上の flow を持つ枝を使用と判断し rfu を 1 に固定する閾値（default: 0.99）
         
         Returns:
-        (total_flow, flow_val):
-            total_flow (float): 目的関数値（最大優先フロー）
-            flow_val (dict): {arc_id: flow値} フローが正の枝のみ
+            (total_flow, flow_val):
+                total_flow (float): 目的関数値（最大優先フロー）
+                flow_val (dict): {arc_id: flow値} フローが正の枝のみ
         """        
 
         # env
@@ -345,6 +354,9 @@ class ILP_Solver:
         # model initialization
         model = gp.Model(env=env, name=METHOD_NAMES[mpf_flag])
         model._threshold = 1.0
+        model._time_limit_cb = time_limit_cb
+        model._flow_lb_tol = flow_lb_tol
+        model._flow_ub_tol = flow_ub_tol
 
         # variables
         # flow
@@ -386,17 +398,17 @@ class ILP_Solver:
                 if model.Status == GRB.OPTIMAL:
                     break
                 else:
-                    # rfu がほぼ0 → 対応する枝は使わないと判断し ub=0 に固定
-                    # rfu がほぼ1 → 対応する枝は使うと判断し lb=1 に固定                    
+                    # flow値 がほぼ0 → 対応する枝は使わないと判断し ub=0 に固定
+                    # flow値 がほぼ1 → 対応する枝は使うと判断し lb=1 に固定                    
                     flow_var = {arc: var.X for (arc, var) in flow.items()}
                     rfu_var =  {arc: var.X for (arc, var) in rfu.items()}
                     for (arc, val) in rfu_var.items():
                         if val <= 0.01:
                             for p_arc in self.dg.predecessors(arc):
-                                if flow_var[p_arc] <= 0.01:
+                                if flow_var[p_arc] <= model._flow_lb_tol:
                                     rfu[arc].ub = 0
                         elif val >= 0.99:
-                            if flow_var[arc] >= 0.99:
+                            if flow_var[arc] >= model._flow_ub_tol:
                                 rfu[arc].lb = 1
         else:
             model.update()
@@ -430,6 +442,24 @@ if __name__ == '__main__':
             '(default: run all)'
         )
     )
+    parser_arg.add_argument(
+        '--time-limit-cb', '-t',
+        type=float,
+        default=300,
+        help='Callback time limit in seconds for early termination (default: 300)'
+    )
+    parser_arg.add_argument(
+        '--flow-lb-tol',
+        type=float,
+        default=0.01,
+        help='Flow threshold below which rfu is fixed to 0 in multi-step solving (default: 0.01)'        
+    )
+    parser_arg.add_argument(
+        '--flow-ub-tol',
+        type=float,
+        default=0.99,
+        help='Flow threshold above which rfu is fixed to 1 in multi-step solving (default: 0.99)'
+    )
     args = parser_arg.parse_args()
     filename = args.filename
 
@@ -450,7 +480,7 @@ if __name__ == '__main__':
     # Optimize
     for m in methods_to_run:
         opt_start_time = time.time()        
-        (total_flow, flow_val) = solver.optimize(m)        
+        (total_flow, flow_val) = solver.optimize(m, time_limit_cb=args.time_limit_cb, flow_lb_tol=args.flow_lb_tol, flow_ub_tol=args.flow_ub_tol)        
         opt_end_time = time.time()
         print(f"{METHOD_NAMES[m]}: {total_flow} {opt_end_time - opt_start_time}")
     
