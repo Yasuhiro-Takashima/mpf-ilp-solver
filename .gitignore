@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Gurobi log
+*.log
+*.lp
+*.mps
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Editor
+*.swp
+*~
